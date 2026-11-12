@@ -287,7 +287,7 @@ export function commissionReview({ commission, review, reason, signals, risk, co
     ['Revisions', review.revisions ? escape(review.revisions) : '<span class="muted">Not stated</span>']
   ] : [];
   const unavailable = reason === 'not_configured' ? 'AI review is not configured on this server, so only swoosh.pay\'s own checks ran.'
-    : 'Claude could not review this quote right now, so only swoosh.pay\'s own checks ran. Read the quote carefully.';
+    : 'The AI could not review this quote right now, so only swoosh.pay\'s own checks ran. Read the quote carefully.';
   let action;
   if (commission.payment_id) {
     action = `<p>You already started this payment.</p><a class="button button-primary button-block" href="/checkout/${escape(commission.payment_id)}" data-loading="Opening PayPal…">Continue to PayPal ${arrow}</a>`;
@@ -313,7 +313,7 @@ export function commissionReview({ commission, review, reason, signals, risk, co
     <div class="slip-head"><div class="slip-top">${pill(riskText, riskTone)}<span class="slip-tag">Commission review</span></div>
       ${party('Quote from', commission.handle)}
       <blockquote class="quote">${escape(commission.quote)}</blockquote></div>
-    <div class="slip-section"><div class="section-title"><h2 class="slip-title">Safety check</h2><span class="byline">Claude + swoosh.pay</span></div>
+    <div class="slip-section"><div class="section-title"><h2 class="slip-title">Safety check</h2><span class="byline">AI + swoosh.pay</span></div>
       ${review?.advice ? `<p class="advice">${escape(review.advice)}</p>` : ''}
       ${!review ? `<div class="message message-warn">${unavailable}</div>` : ''}
       <ul class="signals">${signals.map(signal => `<li class="signal signal-${signal.level}">

@@ -131,7 +131,7 @@ export function createSwooshPay({ db, origin, background = promise => promise })
         artist.username, quote.slice(0, 4000), typeof event.token === 'string' ? event.token : null, Date.now());
       const commission = await db.get('SELECT id FROM commissions WHERE source_id = ?', event.id);
       return reply('Review **@' + artist.username.replace(/[*_~`|>]/g, '\\$&') + '**\'s quote before you pay. ' +
-        'Claude reads the terms and checks for scam signals, and nothing is charged until you approve in PayPal.', null, [
+        'AI reads the terms and checks for scam signals, and nothing is charged until you approve in PayPal.', null, [
         { label: 'Review commission', url: origin + '/commission/' + commission.id }
       ]);
     }
@@ -559,7 +559,7 @@ export function createSwooshPay({ db, origin, background = promise => promise })
       if (!commission.analysis) {
         if (!url.searchParams.has('go')) {
           return send(res, 200, page(working({ title: 'Reviewing the quote…',
-            detail: 'Claude is reading the terms in @' + commission.handle + '\'s message and checking it for scam signals.',
+            detail: 'AI is reading the terms in @' + commission.handle + '\'s message and checking it for scam signals.',
             next: base + '?go=1' }), user));
         }
         let analysis = { review: null, reason: aiReady ? null : 'not_configured', at: Date.now() };
