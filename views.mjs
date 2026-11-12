@@ -197,6 +197,7 @@ export function review(payment, recipient, order, origin, paypalReady, merchantF
 
   const facts = [
     [incoming ? 'From' : 'To', '<span class="handle">@' + escape(incoming ? sender?.username || 'unknown' : handle) + '</span>'],
+    ...(payment.memo ? [['For', escape(payment.memo)]] : []),
     ['Amount', dollars(payment.cents) + ' USD'],
     ['Charged', payment.order_id ? (payment.capture_id ? 'Yes' : 'Not yet') : 'No money charged']
   ];
@@ -263,6 +264,65 @@ export function result(payment) {
     ${payment.capture_id && payment.status === 'paid' ? `<div class="slip-section"><dl class="facts"><dt>PayPal receipt</dt>
       <dd><code>${escape(payment.capture_id)}</code></dd></dl></div>` : ''}
     <div class="slip-foot"><span>PayPal Sandbox</span><a href="/payments/${escape(payment.id)}">View payment details</a></div>
+  </article></div>` };
+}
+
+const riskLabels = { low: ['No warning signs found', 'good'], medium: ['Review carefully', 'warn'], high: ['High risk', 'bad'] };
+const levelLabels = { high: 'Warning', medium: 'Caution', info: 'Note', ok: 'Checked' };
+const paymentTypes = { full: 'Full payment', deposit: 'Deposit (part of the price)', balance: 'Remaining balance', unclear: 'Not stated' };
+
+export function commissionReview({ commission, review, reason, signals, risk, connected, paypalReady }) {
+  const [riskText, riskTone] = riskLabels[risk];
+  const handle = escape(commission.handle);
+  const path = '/commission/' + commission.id;
+  const terms = review ? [
+    ['What', review.deliverables.length ? '<ul class="plain">' + review.deliverables.map(item => '<li>' + escape(item) + '</li>').join('') + '</ul>' : escape(review.summary || 'Not stated')],
+    ['Price', review.cents ? dollars(review.cents) + ' USD' : '<span class="muted">No USD price found</span>'],
+    ['Payment', escape(paymentTypes[review.paymentType])],
+    ['Deadline', review.deadline ? escape(review.deadline) : '<span class="muted">Not stated</span>'],
+    ['Revisions', review.revisions ? escape(review.revisions) : '<span class="muted">Not stated</span>']
+  ] : [];
+  const unavailable = reason === 'not_configured' ? 'AI review is not configured on this server, so only swoosh.pay\'s own checks ran.'
+    : 'Claude could not review this quote right now, so only swoosh.pay\'s own checks ran. Read the quote carefully.';
+  let action;
+  if (commission.payment_id) {
+    action = `<p>You already started this payment.</p><a class="button button-primary button-block" href="/checkout/${escape(commission.payment_id)}" data-loading="Opening PayPal…">Continue to PayPal ${arrow}</a>`;
+  } else if (!paypalReady) {
+    action = '<div class="notice">PayPal Platforms Sandbox is awaiting configuration.</div>';
+  } else {
+    const amount = review?.cents ? (review.cents / 100).toFixed(2) : '';
+    action = `<form method="post" action="${path}/pay" class="form">
+      <div class="field"><label for="amount">Amount to pay now</label>
+        <div class="input-affix amount-input"><span class="affix">$</span><input id="amount" name="amount" value="${amount}" placeholder="60.00"
+          inputmode="decimal" maxlength="8" autocomplete="off" required><span class="affix affix-end">USD</span></div>
+        <p class="hint">${review?.cents ? 'Taken from the quote. Change it if you agreed on something else.' : 'Enter the price you agreed on.'}</p></div>
+      <div class="field"><label for="memo">What you're paying for</label>
+        <input class="text-input" id="memo" name="memo" maxlength="120" value="${escape(review?.summary || '')}" placeholder="Full-body character sheet, 2 poses">
+        <p class="hint">Saved on the PayPal order, so the receipt records what you bought if you ever need to open a dispute.</p></div>
+      ${risk === 'high' ? '<div class="message message-bad">Read the warnings above before you continue. PayPal buyer protection only helps if you pay through this checkout.</div>' : ''}
+      <button class="button button-primary button-block" type="submit" data-loading="Creating payment…">${connected
+        ? (risk === 'high' ? 'Continue to PayPal anyway' : 'Continue to PayPal') + ' ' + arrow
+        : 'Create payment and invite @' + handle + ' ' + arrow}</button>
+    </form>`;
+  }
+  return { title: 'Commission review', body: `<div class="detail"><article class="slip">
+    <div class="slip-head"><div class="slip-top">${pill(riskText, riskTone)}<span class="slip-tag">Commission review</span></div>
+      ${party('Quote from', commission.handle)}
+      <blockquote class="quote">${escape(commission.quote)}</blockquote></div>
+    <div class="slip-section"><div class="section-title"><h2 class="slip-title">Safety check</h2><span class="byline">Claude + swoosh.pay</span></div>
+      ${review?.advice ? `<p class="advice">${escape(review.advice)}</p>` : ''}
+      ${!review ? `<div class="message message-warn">${unavailable}</div>` : ''}
+      <ul class="signals">${signals.map(signal => `<li class="signal signal-${signal.level}">
+        <span class="signal-dot" aria-hidden="true"></span><div class="signal-body">
+        <strong>${escape(signal.title)}</strong><span class="sr-only"> (${levelLabels[signal.level]})</span>
+        ${signal.detail ? `<p>${escape(signal.detail)}</p>` : ''}
+        ${signal.evidence ? `<q>${escape(signal.evidence)}</q>` : ''}</div></li>`).join('')}</ul></div>
+    ${review ? `<div class="slip-section"><h2 class="slip-title">Terms in the quote</h2>
+      <dl class="facts facts-left">${terms.map(([term, value]) => `<dt>${term}</dt><dd>${value}</dd>`).join('')}</dl>
+      ${review.missing.length ? `<div class="missing"><span>Not mentioned:</span>${review.missing.map(item => `<span class="chip">${escape(item)}</span>`).join('')}</div>
+        <p class="hint">Agree on these in the DM before paying, so there's a record if something goes wrong.</p>` : ''}</div>` : ''}
+    <div class="slip-section">${action}</div>
+    <div class="slip-foot"><span>To @${handle} · PayPal Sandbox</span><span>Nothing is charged until you approve in PayPal</span></div>
   </article></div>` };
 }
 
@@ -411,7 +471,7 @@ main{flex:1;display:grid;grid-template-columns:minmax(0,1fr);gap:32px;align-cont
 .form-tight{gap:14px}
 .field{display:grid;gap:7px}
 label{font-weight:600;font-size:.9rem}
-.card .hint{font-size:.82rem}
+.hint{font-size:.82rem;color:var(--muted)}
 .input-affix{display:flex;align-items:center;background:var(--surface);border:1px solid var(--line-strong);border-radius:var(--radius-sm);transition:border-color .15s,box-shadow .15s}
 .input-affix:hover{border-color:var(--muted)}
 .input-affix:focus-within{border-color:var(--accent);box-shadow:0 0 0 4px var(--accent-soft)}
@@ -519,6 +579,29 @@ label{font-weight:600;font-size:.9rem}
 .invite .button{min-height:auto;padding-block:12px}
 #copy-invite-status{min-height:1.3em;color:var(--muted);font-size:.85rem}
 
+.quote{margin:0;padding:14px 16px;background:var(--sunken);border-left:3px solid var(--accent);border-radius:0 var(--radius-sm) var(--radius-sm) 0;color:var(--ink);white-space:pre-wrap;overflow-wrap:anywhere;font-size:.95rem;max-height:16rem;overflow:auto}
+.section-title{display:flex;align-items:baseline;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.byline{font:600 .7rem/1 var(--font-mono);text-transform:uppercase;letter-spacing:.08em;color:var(--muted)}
+.slip-section > .advice{color:var(--ink);font-size:1rem}
+.signals{list-style:none;margin:0;padding:0;display:grid;gap:12px}
+.signal{display:grid;grid-template-columns:12px minmax(0,1fr);gap:12px;align-items:start}
+.signal-dot{width:10px;height:10px;margin-top:7px;border-radius:50%;background:var(--muted)}
+.signal-high .signal-dot{background:var(--bad);box-shadow:0 0 0 4px var(--bad-soft)}
+.signal-medium .signal-dot{background:var(--warn);box-shadow:0 0 0 4px var(--warn-soft)}
+.signal-ok .signal-dot{background:var(--good)}
+.signal-info .signal-dot{background:var(--accent)}
+.signal-body{display:grid;gap:3px}
+.signal-body strong{font-size:.95rem}
+.signal-high strong{color:var(--bad)}
+.signal-body p{color:var(--muted);font-size:.88rem}
+.signal-body q{font-size:.85rem;color:var(--ink);font-style:italic}
+.facts-left dd{text-align:left}
+.plain{margin:0;padding-left:1.1em}
+.muted{color:var(--muted)}
+.missing{display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:.85rem;color:var(--muted)}
+.chip{padding:3px 9px;border-radius:999px;background:var(--warn-soft);color:var(--warn);font-weight:600;font-size:.78rem}
+.text-input{width:100%;padding:13px 14px;border:1px solid var(--line-strong);border-radius:var(--radius-sm);background:var(--surface);color:var(--ink);font:inherit}
+.text-input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 4px var(--accent-soft)}
 .hero{display:grid;grid-template-columns:minmax(0,1.1fr) minmax(0,.9fr);gap:56px;align-items:center;padding-block:16px 8px}
 .hero-copy{display:grid;gap:20px;max-width:34rem}
 .hero h1{font:750 clamp(2.5rem,6.2vw,4.2rem)/1.02 var(--font-display);letter-spacing:-.05em}

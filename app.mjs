@@ -1,9 +1,10 @@
 import { createServer } from 'node:http';
 import { createHash, randomUUID } from 'node:crypto';
 import { parseAmount, parseHandle, canClaim } from './payment-input.mjs';
-import { discordReady, paypalReady, discordAuthorize, discordLogin, discordUser, validDiscordSignature, discordEditOriginal,
+import { aiReady, readQuote, safetySignals, overallRisk } from './commission.mjs';
+import { COMMISSION_COMMAND, discordReady, paypalReady, discordAuthorize, discordLogin, discordUser, validDiscordSignature, discordEditOriginal,
   paypal, sellerStatus, eligibleSeller, paypalWebhookReady, validPayPalWebhook } from './integrations.mjs';
-import { page, home, review, claim, result, working, failure, dollars, appScript, inviteScript, stylesheet } from './views.mjs';
+import { page, home, review, claim, result, working, failure, commissionReview, dollars, appScript, inviteScript, stylesheet } from './views.mjs';
 
 export function createSwooshPay({ db, origin }) {
   const callback = origin + '/auth/discord/callback';
@@ -66,13 +67,14 @@ export function createSwooshPay({ db, origin }) {
       unit.amount?.currency_code === 'USD' && unit.amount.value === (payment.cents / 100).toFixed(2));
   }
 
-  async function newPayment({ sourceId = null, sender, recipient = null, handle, cents, discordToken = null }) {
+  async function newPayment({ sourceId = null, sender, recipient = null, handle, cents, discordToken = null,
+    discordTokenExpires = Date.now() + 14 * 60000, memo = null }) {
     const id = randomUUID();
     // A Discord interaction token can edit the original reply for 15 minutes. Keep a margin.
-    await db.run(`INSERT INTO payments(id, source_id, sender, recipient, handle, cents, invite, expires, discord_token, discord_token_expires)
-      VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(source_id) DO NOTHING`,
+    await db.run(`INSERT INTO payments(id, source_id, sender, recipient, handle, cents, invite, expires, discord_token, discord_token_expires, memo)
+      VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(source_id) DO NOTHING`,
       id, sourceId, sender, recipient, handle, cents, randomUUID(), Date.now() + 7 * day,
-      discordToken, discordToken ? Date.now() + 14 * 60000 : null);
+      discordToken, discordToken ? discordTokenExpires : null, memo);
     return sourceId ? await db.get('SELECT * FROM payments WHERE source_id = ?', sourceId) : paymentBy(id);
   }
 
@@ -109,8 +111,25 @@ export function createSwooshPay({ db, origin }) {
     const reply = (content, url, buttons = url ? [{ label: 'Open swoosh.pay', url }] : []) => json(res, { type: 4, data: {
       content, flags: 64, allowed_mentions: { parse: [] }, components: buttons.length ? [{ type: 1, components:
         buttons.map(button => ({ type: 2, style: 5, ...button })) }] : [] } });
-    if (event.type !== 2 || event.data?.name !== 'pay') return reply('Use /pay to start a payment.');
     const sender = event.user || event.member?.user;
+    if (event.type === 2 && event.data?.type === 3 && event.data.name === COMMISSION_COMMAND) {
+      const message = event.data.resolved?.messages?.[event.data.target_id];
+      const artist = message?.author;
+      const quote = typeof message?.content === 'string' ? message.content.trim() : '';
+      if (!sender?.id || !artist?.id) return reply('Right-click the message where the artist quoted the commission.');
+      if (artist.id === sender.id) return reply('That message is yours. Right-click the artist\'s quote instead.');
+      if (artist.bot) return reply('That message is from a bot. Right-click the artist\'s quote instead.');
+      if (!quote) return reply('That message has no text to review. Right-click the message with the price and details.');
+      await db.run(`INSERT INTO commissions(id, source_id, sender, recipient, handle, quote, discord_token, created)
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(source_id) DO NOTHING`, randomUUID(), event.id, sender.id, artist.id,
+        artist.username, quote.slice(0, 4000), typeof event.token === 'string' ? event.token : null, Date.now());
+      const commission = await db.get('SELECT id FROM commissions WHERE source_id = ?', event.id);
+      return reply('Review **@' + artist.username.replace(/[*_~`|>]/g, '\\$&') + '**\'s quote before you pay. ' +
+        'Claude reads the terms and checks for scam signals, and nothing is charged until you approve in PayPal.', null, [
+        { label: 'Review commission', url: origin + '/commission/' + commission.id }
+      ]);
+    }
+    if (event.type !== 2 || event.data?.name !== 'pay') return reply('Use /pay to start a payment.');
     if (sender?.id && event.authorizing_integration_owners?.['1'] === sender.id) {
       const issuedAt = Number((BigInt(event.id) >> 22n) + 1420070400000n);
       await recordDiscordInstallation(sender.id, 1, issuedAt);
@@ -155,7 +174,7 @@ export function createSwooshPay({ db, origin }) {
     const result = await paypal('/v2/checkout/orders', {
       method: 'POST', merchant: current.merchant, requestId: 'create-' + current.id,
       body: { intent: 'CAPTURE', purchase_units: [{
-        reference_id: current.id, payee: { merchant_id: current.merchant },
+        reference_id: current.id, payee: { merchant_id: current.merchant }, description: current.memo || undefined,
         amount: { currency_code: 'USD', value: (current.cents / 100).toFixed(2) }
       }], payment_source: { paypal: { experience_context: {
         shipping_preference: 'NO_SHIPPING', user_action: 'PAY_NOW', return_url: url, cancel_url: url
@@ -400,6 +419,55 @@ export function createSwooshPay({ db, origin }) {
         merchant, user.id, tracking);
       if (!result.changes) error(409, 'A newer connection request has replaced this one.');
       return redirect(res, '/');
+    }
+    const commissionPath = path.match(/^\/commission\/([a-f0-9-]{36})(\/pay)?$/);
+    if (commissionPath) {
+      const commission = await db.get('SELECT * FROM commissions WHERE id = ?', commissionPath[1]);
+      if (!commission) error(404, 'This commission review is unavailable.');
+      const base = '/commission/' + commission.id;
+      if (post && commissionPath[2]) {
+        if (commission.payment_id) return redirect(res, '/checkout/' + commission.payment_id);
+        const form = new URLSearchParams((await readBody(req)).toString());
+        const cents = parseAmount(form.get('amount'));
+        if (!cents) error(400, 'Enter the amount to pay in USD, such as 60 or 60.50.');
+        const memo = String(form.get('memo') || '').replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, 120) || null;
+        const tokenExpires = commission.created + 14 * 60000;
+        const payment = await newPayment({ sourceId: 'commission:' + commission.id, sender: commission.sender,
+          recipient: commission.recipient, handle: commission.handle, cents, memo,
+          discordToken: tokenExpires > Date.now() ? commission.discord_token : null, discordTokenExpires: tokenExpires });
+        await db.run('UPDATE commissions SET payment_id = ? WHERE id = ? AND payment_id IS NULL', payment.id, commission.id);
+        const artist = await userBy(commission.recipient);
+        return redirect(res, artist?.merchant && paypalReady ? '/checkout/' + payment.id : '/payments/' + payment.id);
+      }
+      if (post || commissionPath[2]) error(405, 'Method not allowed.');
+      if (!commission.analysis) {
+        if (!url.searchParams.has('go')) {
+          return send(res, 200, page(working({ title: 'Reviewing the quote…',
+            detail: 'Claude is reading the terms in @' + commission.handle + '\'s message and checking it for scam signals.',
+            next: base + '?go=1' }), user));
+        }
+        let analysis = { review: null, reason: aiReady ? null : 'not_configured', at: Date.now() };
+        if (aiReady) {
+          try {
+            analysis.review = await readQuote(commission.quote, commission.handle);
+          } catch (err) {
+            console.error('Commission review failed: ' + err.message);
+            analysis.reason = 'failed';
+          }
+        }
+        await db.run('UPDATE commissions SET analysis = ? WHERE id = ? AND analysis IS NULL', JSON.stringify(analysis), commission.id);
+        return redirect(res, base);
+      }
+      const analysis = JSON.parse(commission.analysis);
+      const artist = await userBy(commission.recipient);
+      const known = await db.all(`SELECT id, username AS handle FROM users WHERE merchant IS NOT NULL
+        UNION SELECT p.recipient AS id, p.handle FROM payments p WHERE p.sender = ? AND p.recipient IS NOT NULL`, commission.sender);
+      const paid = await db.get(`SELECT COUNT(*) AS count FROM payments WHERE sender = ? AND recipient = ?
+        AND status IN ('paid', 'processing')`, commission.sender, commission.recipient);
+      const signals = safetySignals({ recipientId: commission.recipient, handle: commission.handle, known,
+        paidBefore: paid?.count || 0, connected: Boolean(artist?.merchant), review: analysis.review });
+      return send(res, 200, page(commissionReview({ commission, review: analysis.review, reason: analysis.reason, signals,
+        risk: overallRisk(signals, analysis.review), connected: Boolean(artist?.merchant), paypalReady }), user));
     }
     const fastPath = path.match(/^\/checkout\/([a-f0-9-]{36})$/);
     if (!post && fastPath) {

@@ -2,10 +2,15 @@
   "name": "swoosh.pay",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=22.13" },
+  "engines": {
+    "node": ">=22.13"
+  },
   "scripts": {
     "start": "node --env-file-if-exists=.env server.mjs",
     "discord:register": "node --env-file-if-exists=.env integrations.mjs register",
     "test": "node --test"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^1.8.0"
   }
 }

@@ -12,6 +12,9 @@ export function openStore(path) {
   if (!columns.includes('discord_token')) {
     db.exec(readFileSync(new URL('./migrations/0003_discord_fast_pay.sql', import.meta.url), 'utf8'));
   }
+  if (!db.prepare("SELECT name FROM pragma_table_info('payments')").all().some(column => column.name === 'memo')) {
+    db.exec(readFileSync(new URL('./migrations/0004_commission_review.sql', import.meta.url), 'utf8'));
+  }
   return {
     get: (sql, ...args) => db.prepare(sql).get(...args),
     all: (sql, ...args) => db.prepare(sql).all(...args),

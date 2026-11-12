@@ -10,6 +10,7 @@ import { join } from 'node:path';
 import { runInNewContext } from 'node:vm';
 import { openStore } from './store.mjs';
 import { parseAmount } from './payment-input.mjs';
+import { accountCreatedAt, lookalikes, safetySignals, overallRisk } from './commission.mjs';
 
 function installProviderFixture() {
   const merchant = 'TESTMERCHANT1';
@@ -41,6 +42,9 @@ function installProviderFixture() {
     if (pathname === '/v2/checkout/orders') {
       if (body.purchase_units[0].payee.merchant_id !== merchant || body.purchase_units[0].amount.value !== '60.00') {
         throw new Error('Incorrect payee or amount');
+      }
+      if (orders.size === 2 && body.purchase_units[0].description !== 'Full-body character sheet, 2 poses') {
+        throw new Error('Commission order is missing the agreed terms');
       }
       const suffix = orders.size ? '-' + (orders.size + 1) : '';
       const order = { id: 'SANDBOX-ORDER' + suffix, purchase_units: body.purchase_units, status: 'CREATED',
@@ -88,6 +92,23 @@ function installProviderFixture() {
       }
       return reply({ id: 'fixture-message' });
     }
+    if (pathname === '/v1/messages') {
+      const headers = new Headers(options.headers);
+      if (headers.get('authorization') !== 'Bearer fixture-anthropic' ||!headers.get('anthropic-beta')?.includes('server-side-fallback-2026-07-01') ||
+          body.model !== 'claude-opus-5-5' || body.fallbacks !== 'default' || body.output_config.format.type !== 'json_schema' ||
+          !body.messages[0].content.includes('<quote>\nFull-body character sheet')) {
+        throw new Error('Unexpected Claude request');
+      }
+      return reply({ id: 'msg_fixture', type: 'message', role: 'assistant', model: 'claude-opus-5-5', stop_reason: 'end_turn',
+        usage: { input_tokens: 600, output_tokens: 200 }, content: [{ type: 'text', text: JSON.stringify({
+          summary: 'Full-body character sheet, 2 poses', deliverables: ['Full-body character sheet', '2 poses, flat colour'],
+          amount_usd: 60, payment_type: 'full', deadline: 'By Friday', revisions: null,
+          missing: ['Number of revisions', 'Usage rights'],
+          red_flags: [{ kind: 'friends_and_family', evidence: 'send it as friends and family',
+            explanation: 'Friends and Family payments have no PayPal buyer protection, so you could not get your money back.' }],
+          risk: 'high', advice: 'Pay only through the swoosh.pay checkout, which uses Goods and Services, and agree on revisions first.'
+        }) }] });
+    }
     if (pathname === '/api/v10/users/100000000000000002') {
       return reply({ id: '100000000000000002', username: 'pixelnova' });
     }
@@ -126,6 +147,7 @@ test('Discord and web share review, seller onboarding, checkout and webhook reco
     DISCORD_APPLICATION_ID: 'fixture-app', DISCORD_CLIENT_SECRET: 'fixture-secret', DISCORD_BOT_TOKEN: 'fixture-bot',
     PAYPAL_CLIENT_ID: 'fixture-client', PAYPAL_CLIENT_SECRET: 'fixture-secret',
     PAYPAL_PARTNER_MERCHANT_ID: 'PLATFORM', PAYPAL_PARTNER_BN_CODE: 'fixture-bn', PAYPAL_WEBHOOK_ID: 'fixture-hook',
+    ANTHROPIC_API_KEY: 'fixture-anthropic',
     DISCORD_PUBLIC_KEY: publicKey.export({ format: 'der', type: 'spki' }).subarray(-32).toString('hex') } });
   t.after(async () => {
     if (child.exitCode === null) {
@@ -321,4 +343,66 @@ test('Discord and web share review, seller onboarding, checkout and webhook reco
   assert.equal(again.headers.get('location'), '/paypal/return/' + fastPayment.id);
   const signedInReturn = await fetch(returnUrl, { redirect: 'manual', headers });
   assert.equal(signedInReturn.headers.get('location'), '/payments/' + fastPayment.id);
+
+  // Commission review: right-click the artist's quote, Claude reads it, safety checks run, terms go on the PayPal order.
+  const quoteMessage = { id: 'quote-1', author: { id: recipient, username: 'pixelnova' },
+    content: 'Full-body character sheet, 2 poses, flat colour. $60, done by Friday. Please send it as friends and family to save fees!' };
+  const quoteEvent = { id: 'discord-commission', type: 2, token: 'fixture-commission', user: { id: sender },
+    data: { type: 3, name: 'Pay for this commission', target_id: 'quote-1', resolved: { messages: { 'quote-1': quoteMessage } } } };
+  const ownQuote = await (await interaction({ ...quoteEvent, id: 'discord-own-quote', data: { ...quoteEvent.data,
+    resolved: { messages: { 'quote-1': { ...quoteMessage, author: { id: sender, username: 'sender' } } } } } })).json();
+  assert.match(ownQuote.data.content, /That message is yours/);
+  const quoteReply = await (await interaction(quoteEvent)).json();
+  assert.equal(quoteReply.data.flags, 64);
+  const reviewButton = quoteReply.data.components[0].components[0];
+  assert.equal(reviewButton.label, 'Review commission');
+  assert.deepEqual(await (await interaction(quoteEvent)).json(), quoteReply);
+  assert.match(await (await fetch(reviewButton.url)).text(), /http-equiv="refresh"[\s\S]*Reviewing the quote/);
+  const analyzed = await fetch(reviewButton.url + '?go=1', { redirect: 'manual' });
+  assert.equal(analyzed.status, 303);
+  const commissionHtml = await (await fetch(reviewButton.url)).text();
+  assert.match(commissionHtml, /pill-bad">High risk/);
+  assert.match(commissionHtml, /Asks for Friends and Family/);
+  assert.match(commissionHtml, /<q>send it as friends and family<\/q>/);
+  assert.match(commissionHtml, /Discord account since/);
+  assert.match(commissionHtml, /You&#39;ve paid @pixelnova before/);
+  assert.match(commissionHtml, /class="chip">Usage rights/);
+  assert.match(commissionHtml, /name="amount" value="60.00"/);
+  assert.match(commissionHtml, /name="memo" maxlength="120" value="Full-body character sheet, 2 poses"/);
+  assert.match(commissionHtml, /Continue to PayPal anyway/);
+  assert.equal((await fetch(reviewButton.url + '/pay', { method: 'POST', redirect: 'manual', headers: { Origin: 'https://evil.example' },
+    body: new URLSearchParams({ amount: '60' }) })).status, 403);
+  const startPay = await fetch(reviewButton.url + '/pay', { method: 'POST', redirect: 'manual', headers: { Origin: origin },
+    body: new URLSearchParams({ amount: '60', memo: 'Full-body character sheet, 2 poses' }) });
+  assert.equal(startPay.status, 303);
+  const commissionPayment = db.get("SELECT * FROM payments WHERE source_id LIKE 'commission:%'");
+  assert.equal(startPay.headers.get('location'), '/checkout/' + commissionPayment.id);
+  assert.equal(commissionPayment.recipient, recipient);
+  assert.equal(commissionPayment.cents, 6000);
+  assert.equal(commissionPayment.memo, 'Full-body character sheet, 2 poses');
+  assert.equal(commissionPayment.discord_token, 'fixture-commission');
+  const commissionCheckout = await fetch(origin + '/checkout/' + commissionPayment.id + '?go=1', { redirect: 'manual' });
+  assert.equal(commissionCheckout.headers.get('location'), 'https://www.sandbox.paypal.com/checkoutnow?token=SANDBOX-ORDER-3');
+  const repeatPay = await fetch(reviewButton.url + '/pay', { method: 'POST', redirect: 'manual', headers: { Origin: origin },
+    body: new URLSearchParams({ amount: '60' }) });
+  assert.equal(repeatPay.headers.get('location'), '/checkout/' + commissionPayment.id);
+  assert.match(await (await fetch(origin + '/payments/' + commissionPayment.id, { headers })).text(), /<dt>For<\/dt><dd>Full-body character sheet, 2 poses/);
+});
+
+test('commission safety checks: account age, lookalike handles and overall risk', () => {
+  assert.equal(new Date(accountCreatedAt('175928847299117063')).toISOString(), '2016-04-30T11:18:25.796Z');
+  const known = [{ id: '1', handle: 'pixelnova' }, { id: '2', handle: 'inkwell' }];
+  assert.deepEqual(lookalikes('pixeinova', '9', known).map(match => match.handle), ['pixelnova']);
+  assert.deepEqual(lookalikes('pixel_nova', '9', known).map(match => match.handle), ['pixelnova']);
+  assert.deepEqual(lookalikes('pixelnova', '1', known), []);
+  assert.deepEqual(lookalikes('mossbyte', '9', known), []);
+  const now = Date.UTC(2026, 10, 12);
+  const freshId = String(BigInt(now - 2 * 86400000 - 1420070400000) << 22n);
+  const signals = safetySignals({ recipientId: freshId, handle: 'pixeinova', known, paidBefore: 0, connected: false, review: null, now });
+  assert.deepEqual(signals.map(signal => [signal.level, signal.title]), [
+    ['high', 'Discord account is 2 days old'], ['high', 'Looks like @pixelnova'], ['info', 'PayPal not connected yet']
+  ]);
+  assert.equal(overallRisk(signals, null), 'high');
+  assert.equal(overallRisk([{ level: 'ok' }], { risk: 'medium' }), 'medium');
+  assert.equal(overallRisk([{ level: 'ok' }, { level: 'info' }], { risk: 'low' }), 'low');
 });

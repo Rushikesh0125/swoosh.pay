@@ -12,6 +12,7 @@ const discordKey = /^[a-f0-9]{64}$/i.test(env.DISCORD_PUBLIC_KEY || '')
   ? createPublicKey({ key: Buffer.from('302a300506032b6570032100' + env.DISCORD_PUBLIC_KEY, 'hex'), format: 'der', type: 'spki' })
   : null;
 
+export const COMMISSION_COMMAND = 'Pay for this commission';
 export const discordReady = Boolean(env.DISCORD_APPLICATION_ID && env.DISCORD_CLIENT_SECRET);
 export const paypalReady = Boolean(clientId && clientSecret && env.PAYPAL_PARTNER_MERCHANT_ID && env.PAYPAL_PARTNER_BN_CODE);
 
@@ -106,13 +107,16 @@ export function eligibleSeller(status) {
 
 if (process.argv[2] === 'register') {
   if (!env.DISCORD_APPLICATION_ID || !env.DISCORD_BOT_TOKEN) throw new Error('Set DISCORD_APPLICATION_ID and DISCORD_BOT_TOKEN');
-  await request(discordOrigin + '/applications/' + env.DISCORD_APPLICATION_ID + '/commands', {
+  const register = command => request(discordOrigin + '/applications/' + env.DISCORD_APPLICATION_ID + '/commands', {
     method: 'POST', headers: { Authorization: 'Bot ' + env.DISCORD_BOT_TOKEN, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name: 'pay', description: 'Pay someone with PayPal through swoosh.pay',
-      integration_types: [1], contexts: [1, 2], options: [
-        { type: 6, name: 'recipient', description: 'The Discord account you are paying', required: true },
-        { type: 3, name: 'amount', description: 'USD amount, such as 60 or 60.50', required: true }
-      ] })
+    body: JSON.stringify(command)
   });
-  console.log('Registered /pay for user installs and DMs.');
+  await register({ name: 'pay', description: 'Pay someone with PayPal through swoosh.pay',
+    integration_types: [1], contexts: [1, 2], options: [
+      { type: 6, name: 'recipient', description: 'The Discord account you are paying', required: true },
+      { type: 3, name: 'amount', description: 'USD amount, such as 60 or 60.50', required: true }
+    ] });
+  // Message command: right-click a quote message → Apps → Pay for this commission.
+  await register({ name: COMMISSION_COMMAND, type: 3, integration_types: [1], contexts: [0, 1, 2] });
+  console.log('Registered /pay and "' + COMMISSION_COMMAND + '" for user installs.');
 }
