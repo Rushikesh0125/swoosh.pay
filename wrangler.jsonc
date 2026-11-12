@@ -1,0 +1,20 @@
+{
+  "name": "handlepay-sandbox",
+  "account_id": "7d7db815f4a8f55e80adbe86d041a846",
+  "main": "worker.mjs",
+  "compatibility_date": "2026-11-12",
+  "workers_dev": true,
+  "preview_urls": false,
+  "upload_source_maps": true,
+  "observability": { "enabled": true },
+  "vars": {
+    "APP_ORIGIN": "https://handlepay-sandbox.jadhav-rushikesh-ggl.workers.dev"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "handlepay-sandbox",
+      "database_id": "92377eb0-3946-4524-852f-6840ffa0bf81"
+    }
+  ]
+}

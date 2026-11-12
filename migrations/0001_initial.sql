@@ -1,0 +1,18 @@
+CREATE TABLE IF NOT EXISTS users (
+  id TEXT PRIMARY KEY, username TEXT NOT NULL, merchant TEXT UNIQUE, referral TEXT UNIQUE
+) STRICT;
+CREATE INDEX IF NOT EXISTS users_username ON users(username);
+CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, user_id TEXT NOT NULL, expires INTEGER NOT NULL) STRICT;
+CREATE TABLE IF NOT EXISTS oauth (
+  state TEXT PRIMARY KEY, target TEXT NOT NULL, expires INTEGER NOT NULL
+) STRICT;
+CREATE TABLE IF NOT EXISTS payments (
+  id TEXT PRIMARY KEY, source_id TEXT UNIQUE, sender TEXT NOT NULL,
+  recipient TEXT, handle TEXT NOT NULL, cents INTEGER NOT NULL CHECK(cents > 0),
+  invite TEXT UNIQUE NOT NULL, expires INTEGER NOT NULL,
+  merchant TEXT, order_id TEXT UNIQUE, create_started INTEGER, capture_started INTEGER,
+  capture_id TEXT UNIQUE, status TEXT NOT NULL DEFAULT 'draft'
+) STRICT;
+CREATE TABLE IF NOT EXISTS paypal_events (
+  id TEXT PRIMARY KEY, received INTEGER NOT NULL
+) STRICT;
