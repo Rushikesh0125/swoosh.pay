@@ -37,7 +37,11 @@ function installProviderFixture() {
     if (pathname === '/v1/customer/partners/PLATFORM/merchant-integrations/' + merchant) {
       return reply({ merchant_id: merchant, tracking_id: tracking, payments_receivable: true, primary_email_confirmed: true,
         oauth_integrations: [{ oauth_third_party: [{ partner_client_id: 'fixture-client',
-          scopes: ['https://uri.paypal.com/services/payments/payment/authcapture'] }] }] });
+          scopes: ['https://uri.paypal.com/services/payments/payment/authcapture',
+            'https://uri.paypal.com/services/vault/payment-tokens/readwrite'] }] }] });
+    }
+    if (pathname === '/v3/vault/payment-tokens/VAULT-FIXTURE' && options.method === 'DELETE') {
+      return new Response(null, { status: 204 });
     }
     if (pathname === '/v2/checkout/orders') {
       if (body.purchase_units[0].payee.merchant_id !== merchant || body.purchase_units[0].amount.value !== '60.00') {
@@ -47,9 +51,21 @@ function installProviderFixture() {
         throw new Error('Commission order is missing the agreed terms');
       }
       const suffix = orders.size ? '-' + (orders.size + 1) : '';
+      const vaultId = body.payment_source?.paypal?.vault_id;
+      if (vaultId) {
+        // A saved PayPal is charged without a buyer redirect: the order comes back captured.
+        if (vaultId !== 'VAULT-FIXTURE' || !options.headers['PayPal-Auth-Assertion'] || body.payment_source.paypal.experience_context) {
+          throw new Error('Unexpected saved PayPal order');
+        }
+        const order = { id: 'SANDBOX-ORDER' + suffix, status: 'COMPLETED', purchase_units: [{ ...body.purchase_units[0],
+          payments: { captures: [{ id: 'SANDBOX-CAPTURE' + suffix, status: 'COMPLETED', amount: body.purchase_units[0].amount }] } }] };
+        orders.set(order.id, { order, approved: true, captureStatus: 'COMPLETED', captureId: 'SANDBOX-CAPTURE' + suffix });
+        return reply(order, 201);
+      }
+      const wantsVault = body.payment_source?.paypal?.attributes?.vault?.store_in_vault === 'ON_SUCCESS';
       const order = { id: 'SANDBOX-ORDER' + suffix, purchase_units: body.purchase_units, status: 'CREATED',
         links: [{ rel: 'payer-action', href: 'https://www.sandbox.paypal.com/checkoutnow?token=SANDBOX-ORDER' + suffix }] };
-      orders.set(order.id, { order, approved: false, captureStatus: null, captureId: 'SANDBOX-CAPTURE' + suffix,
+      orders.set(order.id, { order, approved: false, captureStatus: null, captureId: 'SANDBOX-CAPTURE' + suffix, wantsVault,
         captureAs: orders.size ? 'COMPLETED' : 'PENDING' });
       return reply(order, 201);
     }
@@ -69,6 +85,10 @@ function installProviderFixture() {
         order.purchase_units[0].payments = { captures: [{ id: state.captureId, status: state.captureStatus,
           amount: order.purchase_units[0].amount,
           status_details: state.captureStatus === 'PENDING' ? { reason: 'PENDING_REVIEW' } : undefined }] };
+        // Only the Discord fast-path order saves the buyer's PayPal in this scenario.
+        if (state.wantsVault && order.id === 'SANDBOX-ORDER-2') {
+          order.payment_source = { paypal: { attributes: { vault: { id: 'VAULT-FIXTURE', status: 'VAULTED' } } } };
+        }
       } else if (state.approved) {
         order.status = 'APPROVED';
       } else {
@@ -86,8 +106,10 @@ function installProviderFixture() {
       orders.get(orderId).captureStatus = 'COMPLETED';
       return reply({ verification_status: 'SUCCESS' });
     }
-    if (options.method === 'PATCH' && /^\/api\/v10\/webhooks\/fixture-app\/fixture-interaction\/messages\/@original$/.test(pathname)) {
-      if (!body.content.startsWith('✅ Paid **$60.00** to `@pixelnova`. PayPal receipt `SANDBOX-CAPTURE-2`')) {
+    const discordEdit = pathname.match(/^\/api\/v10\/webhooks\/fixture-app\/(fixture-interaction|fixture-component)\/messages\/@original$/);
+    if (options.method === 'PATCH' && discordEdit) {
+      const receipt = discordEdit[1] === 'fixture-interaction' ? 'SANDBOX-CAPTURE-2' : 'SANDBOX-CAPTURE-4';
+      if (!body.content.startsWith('✅ Paid **$60.00** to `@pixelnova`. PayPal receipt `' + receipt + '`')) {
         throw new Error('Unexpected Discord update ' + body.content);
       }
       return reply({ id: 'fixture-message' });
@@ -387,6 +409,40 @@ test('Discord and web share review, seller onboarding, checkout and webhook reco
     body: new URLSearchParams({ amount: '60' }) });
   assert.equal(repeatPay.headers.get('location'), '/checkout/' + commissionPayment.id);
   assert.match(await (await fetch(origin + '/payments/' + commissionPayment.id, { headers })).text(), /<dt>For<\/dt><dd>Full-body character sheet, 2 poses/);
+
+  // One-tap: the fast-path checkout saved the buyer's PayPal for this artist, so /pay now confirms inside Discord.
+  assert.equal(db.get('SELECT vault_id FROM saved_wallets WHERE sender = ? AND merchant = ?', sender, merchant).vault_id, 'VAULT-FIXTURE');
+  const oneTap = await (await interaction({ ...event, id: 'discord-one-tap', token: 'fixture-one-tap' })).json();
+  const [confirmButton, cancelButton, checkoutButton] = oneTap.data.components[0].components;
+  assert.equal(oneTap.data.flags, 64);
+  assert.deepEqual([confirmButton.label, confirmButton.style, cancelButton.label, cancelButton.style], ['Confirm $60.00', 3, 'Cancel', 2]);
+  const oneTapPayment = db.get('SELECT * FROM payments WHERE source_id = ?', 'discord-one-tap');
+  assert.equal(confirmButton.custom_id, 'confirm:' + oneTapPayment.id);
+  assert.equal(checkoutButton.url, origin + '/checkout/' + oneTapPayment.id);
+  const tap = (customId, user = sender) => interaction({ id: 'click-' + randomUUID(), type: 3, token: 'fixture-component',
+    user: { id: user }, data: { component_type: 2, custom_id: customId } });
+  assert.match((await (await tap(confirmButton.custom_id, outsider)).json()).data.content, /someone else/);
+  const confirmed = await (await tap(confirmButton.custom_id)).json();
+  assert.equal(confirmed.type, 7);
+  assert.match(confirmed.data.content, /^⏳ Paying \*\*\$60\.00\*\* to `@pixelnova` with your saved PayPal/);
+  assert.deepEqual(confirmed.data.components, []);
+  const oneTapRow = () => db.get('SELECT * FROM payments WHERE id = ?', oneTapPayment.id);
+  for (let attempt = 0; attempt < 100 && oneTapRow().discord_token; attempt++) await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(oneTapRow().status, 'paid');
+  assert.equal(oneTapRow().capture_id, 'SANDBOX-CAPTURE-4');
+  assert.equal(oneTapRow().discord_token, null);
+  assert.match((await (await tap(confirmButton.custom_id)).json()).data.content, /already being processed/);
+  const toCancel = await (await interaction({ ...event, id: 'discord-one-tap-cancel' })).json();
+  const cancelReply = await (await tap(toCancel.data.components[0].components[1].custom_id)).json();
+  assert.equal(cancelReply.data.content, 'Canceled. No money was charged.');
+  assert.match((await (await tap(toCancel.data.components[0].components[0].custom_id)).json()).data.content, /not available/);
+  const bigOneTap = await (await interaction({ ...event, id: 'discord-one-tap-limit', data: { ...event.data,
+    options: [{ name: 'recipient', value: recipient }, { name: 'amount', value: '600' }] } })).json();
+  assert.equal(bigOneTap.data.components[0].components[0].label, 'Pay $600.00 with PayPal');
+  assert.match(await senderHome(), /One-tap payments[\s\S]*@pixelnova/);
+  assert.equal((await post('/saved/remove', sender, { merchant })).status, 303);
+  assert.equal(db.get('SELECT COUNT(*) AS count FROM saved_wallets').count, 0);
+  assert.doesNotMatch(await senderHome(), /One-tap payments/);
 });
 
 test('commission safety checks: account age, lookalike handles and overall risk', () => {

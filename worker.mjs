@@ -1,5 +1,5 @@
 import { httpServerHandler } from 'cloudflare:node';
-import { env } from 'cloudflare:workers';
+import { env, waitUntil } from 'cloudflare:workers';
 import { createSwooshPay } from './app.mjs';
 
 const query = (sql, params) => env.DB.prepare(sql).bind(...params);
@@ -9,4 +9,4 @@ const db = {
   run: async (sql, ...params) => ({ changes: (await query(sql, params).run()).meta.changes })
 };
 
-export default httpServerHandler(createSwooshPay({ db, origin: env.APP_ORIGIN }));
+export default httpServerHandler(createSwooshPay({ db, origin: env.APP_ORIGIN, background: waitUntil }));

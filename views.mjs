@@ -105,7 +105,7 @@ function landing(discordReady) {
     <div class="layout layout-even">${discordCard(discordReady, false)}</div>`;
 }
 
-export function home({ user, payments, incoming, discordReady, paypalReady, discordInstalled }) {
+export function home({ user, payments, incoming, saved = [], discordReady, paypalReady, discordInstalled }) {
   if (!user) return { title: 'Pay by Discord handle', body: landing(discordReady) };
   const now = Date.now();
   const sent = payments.map(payment => {
@@ -141,7 +141,11 @@ export function home({ user, payments, incoming, discordReady, paypalReady, disc
             <p class="hint">Up to $99,999.99, with at most two decimal places.</p></div>
           <button class="button button-primary button-block" type="submit" data-loading="Looking up recipient…">Review payment ${arrow}</button>
         </form></section>
-      <div class="side">${receive}${discordCard(discordReady, discordInstalled)}</div>
+      <div class="side">${receive}${saved.length ? `<section class="card"><div class="card-head"><h2>One-tap payments</h2>${pill('Saved PayPal', 'accent')}</div>
+        <p>Your PayPal is saved for these artists. In Discord, /pay to them asks you to tap Confirm and then charges it, with no PayPal page, up to $500 per payment.</p>
+        <ul class="saved-list">${saved.map(wallet => `<li>${avatar(wallet.username || '?', 'sm')}<span class="handle">@${escape(wallet.username || 'unknown artist')}</span>
+          <form method="post" action="/saved/remove"><input type="hidden" name="merchant" value="${escape(wallet.merchant)}">
+          <button class="link-button" type="submit" data-loading="Removing…">Remove</button></form></li>`).join('')}</ul></section>` : ''}${discordCard(discordReady, discordInstalled)}</div>
     </div>
     ${sent.length ? `<section class="activity"><div class="section-head"><h2>Sent payments</h2><span>Latest ${sent.length}</span></div>${ledger(sent)}</section>` : ''}
     ${received.length ? `<section class="activity"><div class="section-head"><h2>Incoming payments</h2><span>Latest ${received.length}</span></div>${ledger(received)}</section>` : ''}
@@ -523,6 +527,9 @@ label{font-weight:600;font-size:.9rem}
 .section-head{display:flex;align-items:baseline;justify-content:space-between;gap:12px}
 .section-head h2{font-size:1.06rem}
 .section-head span{color:var(--muted);font-size:.84rem}
+.saved-list{list-style:none;margin:0;padding:0;display:grid;gap:10px}
+.saved-list li{display:flex;align-items:center;gap:10px;min-width:0}
+.saved-list .handle{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .ledger{list-style:none;margin:0;padding:0;background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden}
 .ledger li+li{border-top:1px solid var(--line)}
 .ledger-row{display:grid;grid-template-columns:auto minmax(0,1fr) auto auto;align-items:center;gap:14px;padding:14px 20px;color:inherit;text-decoration:none;transition:background-color .12s}

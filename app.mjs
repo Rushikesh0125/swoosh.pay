@@ -6,7 +6,13 @@ import { COMMISSION_COMMAND, discordReady, paypalReady, discordAuthorize, discor
   paypal, sellerStatus, eligibleSeller, paypalWebhookReady, validPayPalWebhook } from './integrations.mjs';
 import { page, home, review, claim, result, working, failure, commissionReview, dollars, appScript, inviteScript, stylesheet } from './views.mjs';
 
-export function createSwooshPay({ db, origin }) {
+export function createSwooshPay({ db, origin, background = promise => promise }) {
+  // Work that continues after the response is sent (Workers: waitUntil keeps the isolate alive).
+  const runLater = promise => background(promise.catch(err => console.error('Background task failed: ' + err.message)));
+  // One-tap payments with a saved PayPal: per-payment and rolling 24-hour limits, in cents.
+  const ONE_TAP_LIMIT = 50000;
+  const ONE_TAP_DAILY = 100000;
+  const VAULT_SCOPE = 'https://uri.paypal.com/services/vault/payment-tokens/readwrite';
   const callback = origin + '/auth/discord/callback';
   const day = 86400000;
   const uuid = /^[0-9a-f-]{36}$/;
@@ -129,6 +135,34 @@ export function createSwooshPay({ db, origin }) {
         { label: 'Review commission', url: origin + '/commission/' + commission.id }
       ]);
     }
+    if (event.type === 3) {
+      const [action, id] = String(event.data?.custom_id || '').split(':');
+      const payment = uuid.test(id || '') ? await paymentBy(id) : null;
+      if (!payment || !sender?.id || payment.sender !== sender.id) return reply('This button belongs to someone else\'s payment.');
+      const details = { label: 'Details', url: origin + '/payments/' + payment.id };
+      const update = (content, buttons = []) => json(res, { type: 7, data: { content, allowed_mentions: { parse: [] },
+        components: buttons.length ? [{ type: 1, components: buttons.map(button => ({ type: 2, style: 5, ...button })) }] : [] } });
+      if (action === 'cancel') {
+        const canceled = await db.run(`UPDATE payments SET expires = ? WHERE id = ? AND order_id IS NULL AND merchant IS NULL
+          AND status = 'draft'`, Date.now(), payment.id);
+        return canceled.changes ? update('Canceled. No money was charged.') : update('This payment is already in progress.', [details]);
+      }
+      if (action === 'confirm') {
+        const artist = await userBy(payment.recipient);
+        if (!await oneTapAllowed(payment, artist?.merchant)) {
+          if (payment.merchant || payment.order_id) return update('⏳ This payment is already being processed.', [details]);
+          return update('One-tap payment is not available for this request. Use PayPal checkout instead.',
+            [{ label: 'Pay with PayPal', url: origin + '/checkout/' + payment.id }]);
+        }
+        const claimed = await db.run(`UPDATE payments SET merchant = ?, create_started = ?, discord_token = ?, discord_token_expires = ?
+          WHERE id = ? AND merchant IS NULL AND order_id IS NULL AND status = 'draft'`, artist.merchant, Date.now(),
+          typeof event.token === 'string' ? event.token : null, Date.now() + 14 * 60000, payment.id);
+        if (!claimed.changes) return update('⏳ This payment is already being processed.', [details]);
+        runLater(chargeSaved(payment.id));
+        return update('⏳ Paying **' + dollars(payment.cents) + '** to `@' + payment.handle + '` with your saved PayPal…');
+      }
+      return reply('Use /pay to start a payment.');
+    }
     if (event.type !== 2 || event.data?.name !== 'pay') return reply('Use /pay to start a payment.');
     if (sender?.id && event.authorizing_integration_owners?.['1'] === sender.id) {
       const issuedAt = Number((BigInt(event.id) >> 22n) + 1420070400000n);
@@ -145,6 +179,14 @@ export function createSwooshPay({ db, origin }) {
     const linked = await userBy(recipient.id);
     if (linked?.merchant && paypalReady) {
       const amount = dollars(payment.cents);
+      if (await oneTapAllowed(payment, linked.merchant)) {
+        return reply('**' + amount + '** to `@' + payment.handle + '`\nUses the PayPal you saved for @' + payment.handle +
+          '. Tap **Confirm** to pay now, with no PayPal page.', null, [
+          { style: 3, label: 'Confirm ' + amount, custom_id: 'confirm:' + payment.id },
+          { style: 2, label: 'Cancel', custom_id: 'cancel:' + payment.id },
+          { label: 'Use PayPal checkout', url: origin + '/checkout/' + payment.id }
+        ]);
+      }
       return reply('**' + amount + '** to `@' + payment.handle + '`\nTap Pay to approve in PayPal. ' +
         'The payment completes as soon as you approve, and this message updates with the receipt.', null, [
         { label: 'Pay ' + amount + ' with PayPal', url: origin + '/checkout/' + payment.id },
@@ -166,6 +208,11 @@ export function createSwooshPay({ db, origin }) {
     }
     const status = await sellerStatus(recipient.merchant);
     if (!eligibleSeller(status)) error(409, 'The recipient’s PayPal account needs attention before it can receive this payment.');
+    const sellerAllowsVault = status.oauth_integrations?.some(integration => integration.oauth_third_party?.some(grant =>
+      grant.scopes?.includes(VAULT_SCOPE)));
+    const alreadySaved = await db.get('SELECT 1 FROM saved_wallets WHERE sender = ? AND merchant = ?', payment.sender, recipient.merchant);
+    const vault = sellerAllowsVault && !alreadySaved
+      ? { attributes: { vault: { store_in_vault: 'ON_SUCCESS', usage_type: 'MERCHANT', customer_type: 'CONSUMER' } } } : {};
     await db.run(`UPDATE payments SET merchant = ?, create_started = COALESCE(create_started, ?)
       WHERE id = ? AND merchant IS NULL`, recipient.merchant, Date.now(), payment.id);
     const current = await paymentBy(payment.id);
@@ -178,7 +225,7 @@ export function createSwooshPay({ db, origin }) {
         amount: { currency_code: 'USD', value: (current.cents / 100).toFixed(2) }
       }], payment_source: { paypal: { experience_context: {
         shipping_preference: 'NO_SHIPPING', user_action: 'PAY_NOW', return_url: url, cancel_url: url
-      } } } }
+      }, ...vault } } }
     });
     await db.run(`UPDATE payments SET order_id = ?, status = 'awaiting_approval' WHERE id = ? AND order_id IS NULL`, result.id, current.id);
     return result;
@@ -191,6 +238,11 @@ export function createSwooshPay({ db, origin }) {
   }
 
   async function reconcile(payment, order) {
+    const saved = order.payment_source?.paypal?.attributes?.vault;
+    if (saved?.id && saved.status === 'VAULTED' && payment.merchant && order.id === payment.order_id) {
+      await db.run(`INSERT INTO saved_wallets(sender, merchant, vault_id, created) VALUES(?, ?, ?, ?)
+        ON CONFLICT(sender, merchant) DO UPDATE SET vault_id = excluded.vault_id`, payment.sender, payment.merchant, saved.id, Date.now());
+    }
     const capture = orderCapture(payment, order);
     if (!capture?.id) return null;
     const status = { COMPLETED: 'paid', PENDING: 'processing', DECLINED: 'failed', DENIED: 'failed', FAILED: 'failed',
@@ -258,6 +310,56 @@ export function createSwooshPay({ db, origin }) {
     if (payment.status !== 'processing') {
       await db.run('UPDATE payments SET discord_token = NULL WHERE id = ? AND discord_token = ?', payment.id, payment.discord_token);
     }
+  }
+
+  async function editDiscord(payment, content, buttons = []) {
+    if (!payment?.discord_token || payment.discord_token_expires <= Date.now()) return;
+    try {
+      await discordEditOriginal(payment.discord_token, { content, allowed_mentions: { parse: [] }, components: buttons.length
+        ? [{ type: 1, components: buttons.map(button => ({ type: 2, style: 5, ...button })) }] : [] });
+    } catch (err) {
+      console.error('Discord message update failed: ' + err.message);
+    }
+  }
+
+  async function savedWallet(sender, merchant) {
+    return merchant ? db.get('SELECT * FROM saved_wallets WHERE sender = ? AND merchant = ?', sender, merchant) : null;
+  }
+
+  async function oneTapAllowed(payment, merchant) {
+    if (!merchant || !await savedWallet(payment.sender, merchant)) return false;
+    if (payment.order_id || payment.status !== 'draft' || payment.expires <= Date.now() || payment.cents > ONE_TAP_LIMIT) return false;
+    // Payments created in the last 24 hours (expires is creation time + 7 days).
+    const today = await db.get(`SELECT COALESCE(SUM(cents), 0) AS total FROM payments WHERE sender = ? AND id != ?
+      AND status IN ('paid', 'processing') AND expires > ?`, payment.sender, payment.id, Date.now() + 6 * day);
+    return today.total + payment.cents <= ONE_TAP_DAILY;
+  }
+
+  // Charges the buyer's saved PayPal for this artist, then edits the Discord message with the result.
+  async function chargeSaved(id) {
+    const payment = await paymentBy(id);
+    const wallet = await savedWallet(payment.sender, payment.merchant);
+    try {
+      if (!wallet) error(409, 'No saved PayPal for this artist.');
+      const order = await paypal('/v2/checkout/orders', { method: 'POST', merchant: payment.merchant, requestId: 'one-tap-' + payment.id, body: {
+        intent: 'CAPTURE', purchase_units: [{ reference_id: payment.id, payee: { merchant_id: payment.merchant },
+          description: payment.memo || undefined, amount: { currency_code: 'USD', value: (payment.cents / 100).toFixed(2) } }],
+        payment_source: { paypal: { vault_id: wallet.vault_id } }
+      } });
+      await db.run(`UPDATE payments SET order_id = ?, status = 'awaiting_approval' WHERE id = ? AND order_id IS NULL`, order.id, payment.id);
+      if (order.status === 'APPROVED') await capture(await paymentBy(payment.id), order);
+      else await reconcile(await paymentBy(payment.id), order);
+    } catch (err) {
+      // A rejected saved PayPal (revoked or expired) is forgotten; the buyer can still pay through checkout.
+      if (wallet && err.status >= 400 && err.status < 500) {
+        await db.run('DELETE FROM saved_wallets WHERE sender = ? AND merchant = ?', wallet.sender, wallet.merchant);
+      }
+      await db.run('UPDATE payments SET merchant = NULL, create_started = NULL WHERE id = ? AND order_id IS NULL', id);
+      await editDiscord(await paymentBy(id), 'Your saved PayPal could not be charged, so no money was taken. You can pay through PayPal checkout instead.',
+        [{ label: 'Pay with PayPal', url: origin + '/checkout/' + id }]);
+      throw err;
+    }
+    await notifyDiscord(id);
   }
 
   async function checkout(payment, recipient, res, done = '/payments/' + payment.id) {
@@ -348,7 +450,9 @@ export function createSwooshPay({ db, origin }) {
         (SELECT installed FROM discord_installations WHERE user_id = ?),
         EXISTS(SELECT 1 FROM payments WHERE sender = ? AND source_id IS NOT NULL)
       ) AS installed`, user.id, user.id);
-      return send(res, 200, page(home({ user, payments, incoming, discordReady, paypalReady,
+      const saved = user ? await db.all(`SELECT s.merchant, u.username FROM saved_wallets s
+        LEFT JOIN users u ON u.merchant = s.merchant WHERE s.sender = ? ORDER BY s.created DESC`, user.id) : [];
+      return send(res, 200, page(home({ user, payments, incoming, saved, discordReady, paypalReady,
         discordInstalled: Boolean(installation?.installed) }), user));
     }
     if (post && path === '/payments') {
@@ -385,6 +489,18 @@ export function createSwooshPay({ db, origin }) {
       }
       return send(res, 200, page(claim(payment, user, paypalReady, await userBy(payment.sender)), user));
     }
+    if (post && path === '/saved/remove') {
+      if (!user) return redirect(res, login('/'));
+      const form = new URLSearchParams((await readBody(req)).toString());
+      const wallet = await savedWallet(user.id, form.get('merchant'));
+      if (wallet) {
+        await db.run('DELETE FROM saved_wallets WHERE sender = ? AND merchant = ?', user.id, wallet.merchant);
+        // Also revoke it at PayPal. DELETE returns no body, so a parse error here is expected and harmless.
+        await paypal('/v3/vault/payment-tokens/' + encodeURIComponent(wallet.vault_id), { method: 'DELETE', merchant: wallet.merchant })
+          .catch(() => {});
+      }
+      return redirect(res, '/');
+    }
     if (post && path === '/seller/connect') {
       if (!user) return redirect(res, login('/'));
       if (user.merchant) error(409, 'This Discord account already has a PayPal seller connection.');
@@ -396,7 +512,7 @@ export function createSwooshPay({ db, origin }) {
       const result = await paypal('/v2/customer/partner-referrals', { method: 'POST', body: {
         tracking_id: tracking, partner_config_override: { return_url: origin + '/seller/return' },
         operations: [{ operation: 'API_INTEGRATION', api_integration_preference: { rest_api_integration: {
-          integration_method: 'PAYPAL', integration_type: 'THIRD_PARTY', third_party_details: { features: ['PAYMENT', 'REFUND'] }
+          integration_method: 'PAYPAL', integration_type: 'THIRD_PARTY', third_party_details: { features: ['PAYMENT', 'REFUND', 'VAULT', 'BILLING_AGREEMENT'] }
         } } }], products: ['EXPRESS_CHECKOUT'], legal_consents: [{ type: 'SHARE_DATA_CONSENT', granted: true }]
       } });
       const link = result.links?.find(value => value.rel === 'action_url')?.href;
